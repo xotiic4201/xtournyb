@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import supabase
 import os
 from datetime import datetime
@@ -24,11 +24,7 @@ supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
 supabase_client = supabase.create_client(supabase_url, supabase_key)
 
-# Hardcoded owner credentials
-OWNER_USERNAME = "xotiic"
-OWNER_PASSWORD = "40671Mps19*"
-
-print(f"✅ Owner credentials loaded - Username: {OWNER_USERNAME}")
+print(f"✅ Supabase connected")
 
 # Pydantic models
 class UserLogin(BaseModel):
@@ -38,109 +34,108 @@ class UserLogin(BaseModel):
 class UserSignup(BaseModel):
     username: str
     password: str
+    email: Optional[str] = None
+
+class MovieResponse(BaseModel):
+    id: int
+    title: str
+    description: str
+    genre: str
+    release_year: int
+    type: str
+    thumbnail: str
+    video_url: str
 
 @app.post("/auth/login")
 async def login(login_data: UserLogin):
     try:
-        print(f"🔐 Login attempt for username: {login_data.username}")
+        print(f"🔐 Login attempt: {login_data.username}")
         
-        # Hardcoded owner check FIRST (bypass database)
-        if login_data.username == OWNER_USERNAME and login_data.password == OWNER_PASSWORD:
-            print("✅ Owner login successful (hardcoded)")
-            
-            # Check if owner profile exists in database
-            profile_response = supabase_client.table('profiles').select('*').eq('username', login_data.username).execute()
-            
-            if profile_response.data:
-                user_profile = profile_response.data[0]
-            else:
-                # Create owner profile if it doesn't exist
-                fake_email = f"{login_data.username}@localhost.local"
-                user_id = str(uuid.uuid4())
-                
-                user_profile = {
-                    "id": user_id,
-                    "username": login_data.username,
-                    "email": fake_email,
-                    "role": "owner",
-                    "created_at": datetime.now().isoformat()
-                }
-                
-                supabase_client.table('profiles').insert(user_profile).execute()
-                print("✅ Created owner profile in database")
-            
-            # Return fake token (since we're bypassing Supabase Auth)
-            return {
-                "token": "hardcoded_owner_token_123456789",
-                "user": user_profile
-            }
+        # Direct database query for user
+        result = supabase_client.table('profiles')\
+            .select('*')\
+            .eq('username', login_data.username)\
+            .execute()
         
-        # For non-owner users, check database
-        profile_response = supabase_client.table('profiles').select('*').eq('username', login_data.username).execute()
-        
-        if not profile_response.data:
-            print(f"❌ No profile found for username: {login_data.username}")
+        if not result.data:
+            print(f"❌ User not found: {login_data.username}")
             raise HTTPException(status_code=401, detail="Invalid username or password")
         
-        user_profile = profile_response.data[0]
+        user = result.data[0]
         
-        # Simple password check (stored in plain text in database)
-        if user_profile.get('password') != login_data.password:
-            print(f"❌ Password mismatch for {login_data.username}")
+        # Plain text password check
+        if user['password'] != login_data.password:
+            print(f"❌ Password mismatch for: {login_data.username}")
             raise HTTPException(status_code=401, detail="Invalid username or password")
-        
-        print(f"✅ Login successful for {login_data.username}")
         
         # Update last login
-        supabase_client.table('profiles').update({
-            "last_login": datetime.now().isoformat()
-        }).eq('id', user_profile['id']).execute()
+        supabase_client.table('profiles')\
+            .update({'last_login': datetime.now().isoformat()})\
+            .eq('id', user['id'])\
+            .execute()
+        
+        print(f"✅ Login successful: {login_data.username} (Role: {user['role']})")
+        
+        # Don't send password back to client
+        user_copy = user.copy()
+        user_copy.pop('password', None)
         
         return {
-            "token": f"user_token_{user_profile['id']}",
-            "user": user_profile
+            "token": f"token_{user['id']}",
+            "user": user_copy
         }
-            
+        
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Unexpected login error: {str(e)}")
+        print(f"❌ Login error: {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
 @app.post("/auth/register")
 async def register(user: UserSignup):
     try:
-        print(f"📝 Registration attempt for username: {user.username}")
+        print(f"📝 Registration attempt: {user.username}")
         
         # Check if username exists
-        existing = supabase_client.table('profiles').select('*').eq('username', user.username).execute()
+        existing = supabase_client.table('profiles')\
+            .select('*')\
+            .eq('username', user.username)\
+            .execute()
+        
         if existing.data:
             raise HTTPException(status_code=400, detail="Username already taken")
         
-        # Check if this is the owner
-        is_owner = (user.username == OWNER_USERNAME and user.password == OWNER_PASSWORD)
-        
-        # Create fake email (since Supabase Auth requires email)
-        fake_email = f"{user.username}@localhost.local"
+        # Generate UUID for new user
         user_id = str(uuid.uuid4())
         
-        # Create profile with plain text password
-        profile_data = {
+        # Use provided email or create a fake one
+        email = user.email if user.email else f"{user.username}@user.local"
+        
+        # Create new profile
+        new_user = {
             "id": user_id,
             "username": user.username,
-            "email": fake_email,
-            "password": user.password,  # STORED IN PLAIN TEXT (not secure but you asked for it)
-            "role": "owner" if is_owner else "user",
+            "email": email,
+            "password": user.password,  # Plain text as per your DB
+            "role": "user",
             "created_at": datetime.now().isoformat()
         }
         
-        supabase_client.table('profiles').insert(profile_data).execute()
-        print(f"✅ User {user.username} created with role: {profile_data['role']}")
+        result = supabase_client.table('profiles')\
+            .insert(new_user)\
+            .execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=400, detail="Failed to create user")
+        
+        created_user = result.data[0]
+        created_user.pop('password', None)  # Remove password from response
+        
+        print(f"✅ User created: {user.username}")
         
         return {
-            "message": "Signup successful",
-            "role": profile_data["role"],
-            "user": profile_data
+            "message": "Registration successful",
+            "user": created_user
         }
         
     except HTTPException:
@@ -155,12 +150,122 @@ async def get_movies(type: Optional[str] = None):
         query = supabase_client.table('movies').select('*')
         if type:
             query = query.eq('type', type)
-        movies = query.execute()
-        return {"movies": movies.data}
+        
+        result = query.execute()
+        return {"movies": result.data}
+        
     except Exception as e:
-        print(f"Error fetching movies: {e}")
+        print(f"❌ Error fetching movies: {e}")
         return {"movies": []}
+
+@app.get("/movies/{movie_id}")
+async def get_movie(movie_id: int):
+    try:
+        result = supabase_client.table('movies')\
+            .select('*')\
+            .eq('id', movie_id)\
+            .execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Movie not found")
+        
+        return {"movie": result.data[0]}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching movie: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/movies/search/{query}")
+async def search_movies(query: str):
+    try:
+        result = supabase_client.table('movies')\
+            .select('*')\
+            .ilike('title', f'%{query}%')\
+            .execute()
+        
+        return {"movies": result.data}
+        
+    except Exception as e:
+        print(f"❌ Error searching movies: {e}")
+        return {"movies": []}
+
+@app.get("/profile/{username}")
+async def get_profile(username: str):
+    try:
+        result = supabase_client.table('profiles')\
+            .select('id, username, email, role, avatar_url, created_at')\
+            .eq('username', username)\
+            .execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        return {"profile": result.data[0]}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching profile: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "database": "connected"
+    }
+
+# Admin routes (owner only)
+@app.get("/admin/users")
+async def get_all_users():
+    try:
+        result = supabase_client.table('profiles')\
+            .select('id, username, email, role, created_at, last_login')\
+            .execute()
+        
+        return {"users": result.data}
+        
+    except Exception as e:
+        print(f"❌ Error fetching users: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/admin/movies")
+async def add_movie(movie: dict):
+    try:
+        movie_data = {
+            "title": movie.get("title"),
+            "description": movie.get("description"),
+            "genre": movie.get("genre"),
+            "release_year": movie.get("release_year"),
+            "type": movie.get("type"),
+            "thumbnail": movie.get("thumbnail"),
+            "video_url": movie.get("video_url"),
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = supabase_client.table('movies')\
+            .insert(movie_data)\
+            .execute()
+        
+        return {"message": "Movie added", "movie": result.data[0]}
+        
+    except Exception as e:
+        print(f"❌ Error adding movie: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/admin/movies/{movie_id}")
+async def delete_movie(movie_id: int):
+    try:
+        supabase_client.table('movies')\
+            .delete()\
+            .eq('id', movie_id)\
+            .execute()
+        
+        return {"message": "Movie deleted"}
+        
+    except Exception as e:
+        print(f"❌ Error deleting movie: {e}")
+        raise HTTPException(status_code=400, detail=str(e))

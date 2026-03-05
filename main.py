@@ -24,9 +24,9 @@ supabase_key = os.getenv("SUPABASE_KEY")
 supabase_client = supabase.create_client(supabase_url, supabase_key)
 
 # Owner credentials
-OWNER_USERNAME = os.getenv("OWNER_USERNAME", "xotiic")
-OWNER_PASSWORD = os.getenv("OWNER_PASSWORD", "40671Mps19*")
-OWNER_EMAIL = os.getenv("OWNER_EMAIL", "xotiic@example.com")
+OWNER_USERNAME = os.getenv("OWNER_USERNAME")
+OWNER_PASSWORD = os.getenv("OWNER_PASSWORD")
+OWNER_EMAIL = os.getenv("OWNER_EMAIL")
 
 # Pydantic models
 class UserLogin(BaseModel):

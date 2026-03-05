@@ -6,6 +6,7 @@ from typing import Optional
 import supabase
 import os
 from datetime import datetime
+import time
 
 app = FastAPI()
 
@@ -23,10 +24,9 @@ supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
 supabase_client = supabase.create_client(supabase_url, supabase_key)
 
-# Owner credentials
+# Owner credentials from Render env
 OWNER_USERNAME = os.getenv("OWNER_USERNAME")
 OWNER_PASSWORD = os.getenv("OWNER_PASSWORD")
-OWNER_EMAIL = os.getenv("OWNER_EMAIL")
 
 # Pydantic models
 class UserLogin(BaseModel):
@@ -101,7 +101,7 @@ async def register(user: UserSignup):
         is_owner = (user.username == OWNER_USERNAME and user.password == OWNER_PASSWORD)
         print(f"User is owner: {is_owner}")
         
-        # Sign up with Supabase Auth - THIS WILL TRIGGER YOUR SQL TRIGGER
+        # Sign up with Supabase Auth
         try:
             auth_response = supabase_client.auth.sign_up({
                 "email": user.email,
@@ -118,75 +118,72 @@ async def register(user: UserSignup):
                 
             print(f"Supabase Auth user created with ID: {auth_response.user.id}")
             
+            # Wait a moment for the trigger to complete
+            time.sleep(1)
+            
+            # Check if profile was created by trigger
+            profile_response = supabase_client.table('profiles').select('*').eq('id', auth_response.user.id).execute()
+            
+            if profile_response.data:
+                # Profile exists from trigger
+                profile = profile_response.data[0]
+                
+                # Update role if this is owner
+                if is_owner and profile.get('role') != 'owner':
+                    supabase_client.table('profiles').update({
+                        "role": "owner"
+                    }).eq('id', auth_response.user.id).execute()
+                    profile['role'] = 'owner'
+                
+                return {
+                    "message": "Signup successful",
+                    "role": profile['role'],
+                    "user": profile
+                }
+            else:
+                # Trigger failed - create profile manually
+                profile_data = {
+                    "id": auth_response.user.id,
+                    "username": user.username,
+                    "email": user.email,
+                    "role": "owner" if is_owner else "user",
+                    "created_at": datetime.now().isoformat()
+                }
+                supabase_client.table('profiles').insert(profile_data).execute()
+                
+                return {
+                    "message": "Signup successful",
+                    "role": profile_data["role"],
+                    "user": profile_data
+                }
+            
         except Exception as auth_error:
             print(f"Supabase Auth signup error: {str(auth_error)}")
-            error_msg = str(auth_error)
-            if "Database error saving new user" in error_msg:
-                # This likely means the trigger failed - let's check if profile was created
-                # Try to find the user in auth to get their ID
+            
+            # Check if user already exists
+            if "User already registered" in str(auth_error):
+                # Try to login to get the user
                 try:
-                    # Attempt to login to see if user was created
-                    check_auth = supabase_client.auth.sign_in_with_password({
+                    auth_response = supabase_client.auth.sign_in_with_password({
                         "email": user.email,
                         "password": user.password
                     })
-                    if check_auth.user:
-                        # User was created but trigger failed - let's create profile manually
-                        profile_data = {
-                            "id": check_auth.user.id,
-                            "username": user.username,
-                            "email": user.email,
-                            "role": "owner" if is_owner else "user",
-                            "created_at": datetime.now().isoformat()
-                        }
-                        supabase_client.table('profiles').insert(profile_data).execute()
-                        print("Profile created manually")
+                    
+                    if auth_response.user:
+                        # Check if profile exists
+                        profile_response = supabase_client.table('profiles').select('*').eq('id', auth_response.user.id).execute()
                         
-                        return {
-                            "message": "Signup successful",
-                            "role": profile_data["role"],
-                            "user": profile_data
-                        }
+                        if profile_response.data:
+                            return {
+                                "message": "User already exists",
+                                "user": profile_response.data[0]
+                            }
                 except:
                     pass
-            raise HTTPException(status_code=400, detail=f"Auth signup failed")
-        
-        # If we get here, the trigger should have created the profile
-        # But let's verify and update the role if needed
-        profile_response = supabase_client.table('profiles').select('*').eq('id', auth_response.user.id).execute()
-        
-        if profile_response.data:
-            profile = profile_response.data[0]
-            # Update role if this is owner
-            if is_owner and profile.get('role') != 'owner':
-                supabase_client.table('profiles').update({
-                    "role": "owner"
-                }).eq('id', auth_response.user.id).execute()
-                profile['role'] = 'owner'
-            
-            print("Profile exists from trigger")
-            return {
-                "message": "Signup successful",
-                "role": profile['role'],
-                "user": profile
-            }
-        else:
-            # Trigger failed - create profile manually
-            profile_data = {
-                "id": auth_response.user.id,
-                "username": user.username,
-                "email": user.email,
-                "role": "owner" if is_owner else "user",
-                "created_at": datetime.now().isoformat()
-            }
-            supabase_client.table('profiles').insert(profile_data).execute()
-            print("Profile created manually (trigger failed)")
-            
-            return {
-                "message": "Signup successful",
-                "role": profile_data["role"],
-                "user": profile_data
-            }
+                
+                raise HTTPException(status_code=400, detail="User already registered")
+            else:
+                raise HTTPException(status_code=400, detail=f"Signup failed: {str(auth_error)}")
         
     except HTTPException:
         raise
@@ -196,85 +193,35 @@ async def register(user: UserSignup):
 
 @app.post("/auth/setup-owner")
 async def setup_owner():
-    """One-time endpoint to set up the owner account"""
+    """Set up the owner account"""
     try:
-        # Check if owner already exists in profiles
-        existing = supabase_client.table('profiles').select('*').eq('username', OWNER_USERNAME).execute()
-        if existing.data:
-            return {"message": "Owner already exists", "user": existing.data[0]}
+        # First, check if owner profile exists
+        profile_response = supabase_client.table('profiles').select('*').eq('username', OWNER_USERNAME).execute()
         
-        # Try to create owner in Supabase Auth
-        try:
-            auth_response = supabase_client.auth.sign_up({
-                "email": OWNER_EMAIL,
-                "password": OWNER_PASSWORD,
-                "options": {
-                    "data": {
-                        "username": OWNER_USERNAME
-                    }
-                }
-            })
-            
-            # Wait a moment for trigger
-            import time
-            time.sleep(2)
-            
-            # Check if profile was created by trigger
-            profile_response = supabase_client.table('profiles').select('*').eq('id', auth_response.user.id).execute()
-            
-            if profile_response.data:
-                # Update to owner role
+        if profile_response.data:
+            # Profile exists, update to owner if needed
+            profile = profile_response.data[0]
+            if profile.get('role') != 'owner':
                 supabase_client.table('profiles').update({
                     "role": "owner"
-                }).eq('id', auth_response.user.id).execute()
-                return {"message": "Owner created successfully", "user": profile_response.data[0]}
+                }).eq('id', profile['id']).execute()
+                return {"message": "Owner role updated", "user": profile}
             else:
-                # Create profile manually
-                profile_data = {
-                    "id": auth_response.user.id,
-                    "username": OWNER_USERNAME,
-                    "email": OWNER_EMAIL,
+                return {"message": "Owner already exists", "user": profile}
+        
+        # If no profile, check if we have the email from database
+        # Try to find by email if we know it
+        if OWNER_EMAIL:
+            profile_by_email = supabase_client.table('profiles').select('*').eq('email', OWNER_EMAIL).execute()
+            if profile_by_email.data:
+                profile = profile_by_email.data[0]
+                supabase_client.table('profiles').update({
                     "role": "owner",
-                    "created_at": datetime.now().isoformat()
-                }
-                supabase_client.table('profiles').insert(profile_data).execute()
-                return {"message": "Owner created successfully (manual)", "user": profile_data}
-                
-        except Exception as e:
-            if "User already registered" in str(e):
-                # Try to find the user by email in auth
-                try:
-                    # Attempt to login to get user ID
-                    auth_response = supabase_client.auth.sign_in_with_password({
-                        "email": OWNER_EMAIL,
-                        "password": OWNER_PASSWORD
-                    })
-                    
-                    # Check if profile exists
-                    profile_response = supabase_client.table('profiles').select('*').eq('id', auth_response.user.id).execute()
-                    
-                    if not profile_response.data:
-                        # Create profile
-                        profile_data = {
-                            "id": auth_response.user.id,
-                            "username": OWNER_USERNAME,
-                            "email": OWNER_EMAIL,
-                            "role": "owner",
-                            "created_at": datetime.now().isoformat()
-                        }
-                        supabase_client.table('profiles').insert(profile_data).execute()
-                        return {"message": "Owner profile created", "user": profile_data}
-                    else:
-                        # Update existing profile to owner
-                        supabase_client.table('profiles').update({
-                            "role": "owner"
-                        }).eq('id', auth_response.user.id).execute()
-                        return {"message": "Owner role updated", "user": profile_response.data[0]}
-                        
-                except:
-                    return {"message": "Owner exists in Auth but cannot access. Check Supabase dashboard."}
-            else:
-                raise e
+                    "username": OWNER_USERNAME
+                }).eq('id', profile['id']).execute()
+                return {"message": "Owner role updated", "user": profile}
+        
+        return {"message": "Owner not found. Please register first."}
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

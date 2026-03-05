@@ -27,9 +27,8 @@ supabase_client = supabase.create_client(supabase_url, supabase_key)
 security = HTTPBearer()
 
 # Owner credentials
-OWNER_USERNAME = "xotiic"
-OWNER_PASSWORD = "40671Mps19*"
-
+OWNER_USERNAME = os.getenv("USERNAME")
+OWNER_PASSWORD = os.getenv("PASSWORD")
 # Models
 class User(BaseModel):
     email: str

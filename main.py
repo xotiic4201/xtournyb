@@ -29,14 +29,15 @@ security = HTTPBearer()
 # Owner credentials
 OWNER_USERNAME = os.getenv("USERNAME")
 OWNER_PASSWORD = os.getenv("PASSWORD")
+
 # Models
-class User(BaseModel):
+class UserSignup(BaseModel):
+    username: str
     email: str
     password: str
-    username: str
 
-class Login(BaseModel):
-    email: str
+class UserLogin(BaseModel):
+    username: str
     password: str
 
 class Movie(BaseModel):
@@ -81,12 +82,17 @@ async def is_owner(user = Depends(get_current_user)):
 
 # Auth Routes
 @app.post("/api/auth/signup")
-async def signup(user: User):
+async def signup(user: UserSignup):
     try:
+        # Check if username already exists
+        existing = supabase_client.table('profiles').select('*').eq('username', user.username).execute()
+        if existing.data:
+            raise HTTPException(status_code=400, detail="Username already taken")
+        
         # Check if owner
         role = 'owner' if user.username == OWNER_USERNAME and user.password == OWNER_PASSWORD else 'user'
         
-        # Sign up with Supabase
+        # Sign up with Supabase using email
         auth_response = supabase_client.auth.sign_up({
             "email": user.email,
             "password": user.password
@@ -109,7 +115,7 @@ async def signup(user: User):
         # Log action
         supabase_client.table('logs').insert({
             "action": "User Signup",
-            "user": user.username,
+            "username": user.username,
             "timestamp": datetime.now().isoformat()
         }).execute()
         
@@ -118,23 +124,26 @@ async def signup(user: User):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/auth/login")
-async def login(login_data: Login):
+async def login(login_data: UserLogin):
     try:
-        # Login with Supabase
+        # First get the user's email from profiles using username
+        profile = supabase_client.table('profiles').select('*').eq('username', login_data.username).execute()
+        
+        if not profile.data:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        
+        # Login with Supabase using email
         auth_response = supabase_client.auth.sign_in_with_password({
-            "email": login_data.email,
+            "email": profile.data[0]['email'],
             "password": login_data.password
         })
-        
-        # Get profile
-        profile = supabase_client.table('profiles').select('*').eq('id', auth_response.user.id).execute()
         
         return {
             "token": auth_response.session.access_token,
             "user": profile.data[0]
         }
     except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid username or password")
 
 # Movie Routes
 @app.get("/api/movies")
@@ -196,7 +205,7 @@ async def add_movie(movie: Movie, owner=Depends(is_owner)):
         # Log action
         supabase_client.table('logs').insert({
             "action": f"Movie Added: {movie.title}",
-            "user": owner['username'],
+            "username": owner['username'],
             "timestamp": datetime.now().isoformat()
         }).execute()
         
@@ -213,7 +222,7 @@ async def update_movie(movie_id: int, movie: Movie, owner=Depends(is_owner)):
         # Log action
         supabase_client.table('logs').insert({
             "action": f"Movie Updated: {movie.title}",
-            "user": owner['username'],
+            "username": owner['username'],
             "timestamp": datetime.now().isoformat()
         }).execute()
         
@@ -232,7 +241,7 @@ async def delete_movie(movie_id: int, owner=Depends(is_owner)):
         # Log action
         supabase_client.table('logs').insert({
             "action": f"Movie Deleted: {movie.data[0]['title'] if movie.data else 'Unknown'}",
-            "user": owner['username'],
+            "username": owner['username'],
             "timestamp": datetime.now().isoformat()
         }).execute()
         
@@ -244,7 +253,7 @@ async def delete_movie(movie_id: int, owner=Depends(is_owner)):
 @app.get("/api/community/posts")
 async def get_posts():
     try:
-        posts = supabase_client.table('community_posts').select('*, profiles(username)').order('created_at', desc=True).execute()
+        posts = supabase_client.table('community_posts').select('*, profiles!inner(username)').order('created_at', desc=True).execute()
         return {"posts": posts.data}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -277,7 +286,7 @@ async def delete_post(post_id: int, owner=Depends(is_owner)):
         # Log action
         supabase_client.table('logs').insert({
             "action": f"Community Post Deleted: {post.data[0]['title'] if post.data else 'Unknown'}",
-            "user": owner['username'],
+            "username": owner['username'],
             "timestamp": datetime.now().isoformat()
         }).execute()
         
@@ -327,8 +336,8 @@ async def ban_user(user_id: str, owner=Depends(is_owner)):
         
         # Log action
         supabase_client.table('logs').insert({
-            "action": f"User Banned: {user_id}",
-            "user": owner['username'],
+            "action": f"User Banned",
+            "username": owner['username'],
             "timestamp": datetime.now().isoformat()
         }).execute()
         
@@ -339,19 +348,18 @@ async def ban_user(user_id: str, owner=Depends(is_owner)):
 @app.get("/api/admin/stats")
 async def get_stats(owner=Depends(is_owner)):
     try:
-        movies_count = supabase_client.table('movies').select('count', count='exact').execute()
-        users_count = supabase_client.table('profiles').select('count', count='exact').execute()
-        posts_count = supabase_client.table('community_posts').select('count', count='exact').execute()
+        movies_count = supabase_client.table('movies').select('*', count='exact').execute()
+        users_count = supabase_client.table('profiles').select('*', count='exact').execute()
+        posts_count = supabase_client.table('community_posts').select('*', count='exact').execute()
         
         return {
-            "movies": movies_count.count,
-            "users": users_count.count,
-            "posts": posts_count.count
+            "movies": len(movies_count.data) if movies_count.data else 0,
+            "users": len(users_count.data) if users_count.data else 0,
+            "posts": len(posts_count.data) if posts_count.data else 0
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.on_event("startup")
 async def startup_event():
-    # Create tables if they don't exist (you should run these in Supabase SQL editor)
     print("Xstream API started")

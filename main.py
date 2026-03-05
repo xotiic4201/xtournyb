@@ -979,15 +979,15 @@ class ExportHandler:
 # ==================== FastAPI Models ====================
 class TournamentCreate(BaseModel):
     name: str
-    type: str = Field(..., regex="^(single|double|round_robin)$")
+    type: str = Field(..., pattern="^(single|double|round_robin)$")
     participants: List[str]
     host_password: Optional[str] = None
     host_discord_id: Optional[str] = None
 
 class TournamentUpdate(BaseModel):
     name: Optional[str] = None
-    status: Optional[str] = Field(None, regex="^(pending|active|paused|completed)$")
-    visibility: Optional[str] = Field(None, regex="^(public|private)$")
+    status: Optional[str] = Field(None, pattern="^(pending|active|paused|completed)$")
+    visibility: Optional[str] = Field(None, pattern="^(public|private)$")
 
 class AuthRequest(BaseModel):
     password: Optional[str] = None

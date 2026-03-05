@@ -1,14 +1,6 @@
 fastapi
-uvicorn[standard]
-discord.py
+uvicorn
 supabase
-bcrypt
-pyjwt
-python-dotenv
-pydantic
-qrcode
-pillow
-reportlab
-httpx
-websockets
 python-multipart
+pydantic
+python-dotenv

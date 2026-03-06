@@ -1,11 +1,13 @@
-from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
-from typing import Optional, List, Dict, Any
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from typing import Optional, List
 import supabase
 import os
+import shutil
 from datetime import datetime, timedelta
 import uuid
 import json
@@ -22,6 +24,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Create upload directory
+UPLOAD_DIR = "uploads"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+    os.makedirs(f"{UPLOAD_DIR}/movies")
+    os.makedirs(f"{UPLOAD_DIR}/thumbnails")
+
+# Mount uploads directory
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Supabase setup
 supabase_url = os.getenv("SUPABASE_URL")
@@ -48,7 +60,8 @@ class UserProfileUpdate(BaseModel):
     avatar_url: Optional[str] = None
     bio: Optional[str] = None
 
-class Movie(BaseModel):
+class MovieResponse(BaseModel):
+    id: int
     title: str
     description: str
     genre: str
@@ -56,16 +69,26 @@ class Movie(BaseModel):
     type: str
     thumbnail: str
     video_url: str
+    views: int
+    rating: float
+    created_at: str
 
-class CommunityPost(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
-    content: str = Field(..., min_length=1, max_length=5000)
-    image_url: Optional[str] = None
+class ChatMessage(BaseModel):
+    content: str = Field(..., min_length=1, max_length=500)
+    tags: List[str] = []
+
+class ChatMessageResponse(BaseModel):
+    id: int
+    user_id: str
+    username: str
+    avatar_url: Optional[str]
+    content: str
+    tags: List[str]
+    created_at: str
 
 class Comment(BaseModel):
     content: str = Field(..., min_length=1, max_length=1000)
-    movie_id: Optional[int] = None
-    post_id: Optional[int] = None
+    movie_id: int
 
 # ============================================
 # AUTH MIDDLEWARE
@@ -188,7 +211,7 @@ async def register(user: UserSignup):
             "email": email,
             "password": user.password,
             "role": "user",
-            "avatar_url": f"https://ui-avatars.com/api/?name={user.username}&background=random&color=fff&size=128",
+            "avatar_url": f"https://ui-avatars.com/api/?name={user.username}&background=ff0000&color=fff&size=128",
             "bio": "",
             "created_at": datetime.now().isoformat()
         }
@@ -227,8 +250,141 @@ async def logout():
     return {"message": "Logged out successfully"}
 
 # ============================================
-# MOVIE ROUTES
+# MOVIE ROUTES (WITH UPLOADS)
 # ============================================
+
+@app.post("/admin/movies/upload", dependencies=[Depends(require_owner)])
+async def upload_movie(
+    title: str = Form(...),
+    description: str = Form(...),
+    genre: str = Form(...),
+    release_year: int = Form(...),
+    type: str = Form(...),
+    thumbnail: UploadFile = File(...),
+    video: UploadFile = File(...)
+):
+    """Upload a movie with thumbnail and video file (owner only)"""
+    try:
+        # Validate file types
+        if not thumbnail.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="Thumbnail must be an image")
+        
+        if not video.content_type.startswith('video/'):
+            raise HTTPException(status_code=400, detail="Video must be a video file")
+        
+        # Generate unique filenames
+        thumbnail_filename = f"thumb_{uuid.uuid4()}_{thumbnail.filename}"
+        video_filename = f"video_{uuid.uuid4()}_{video.filename}"
+        
+        thumbnail_path = f"{UPLOAD_DIR}/thumbnails/{thumbnail_filename}"
+        video_path = f"{UPLOAD_DIR}/movies/{video_filename}"
+        
+        # Save files
+        with open(thumbnail_path, "wb") as buffer:
+            shutil.copyfileobj(thumbnail.file, buffer)
+        
+        with open(video_path, "wb") as buffer:
+            shutil.copyfileobj(video.file, buffer)
+        
+        # Create URLs
+        thumbnail_url = f"/uploads/thumbnails/{thumbnail_filename}"
+        video_url = f"/uploads/movies/{video_filename}"
+        
+        # Insert into database
+        movie_data = {
+            "title": title,
+            "description": description,
+            "genre": genre,
+            "release_year": release_year,
+            "type": type,
+            "thumbnail": thumbnail_url,
+            "video_url": video_url,
+            "views": 0,
+            "rating": 0,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = supabase_client.table('movies').insert(movie_data).execute()
+        
+        return {
+            "message": "Movie uploaded successfully",
+            "movie": result.data[0]
+        }
+        
+    except Exception as e:
+        print(f"Error uploading movie: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/admin/movies", dependencies=[Depends(require_owner)])
+async def add_movie(movie: dict):
+    """Add a movie with URL (owner only)"""
+    try:
+        movie_data = {
+            "title": movie.get("title"),
+            "description": movie.get("description"),
+            "genre": movie.get("genre"),
+            "release_year": movie.get("release_year"),
+            "type": movie.get("type"),
+            "thumbnail": movie.get("thumbnail"),
+            "video_url": movie.get("video_url"),
+            "views": 0,
+            "rating": 0,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = supabase_client.table('movies').insert(movie_data).execute()
+        
+        return {"message": "Movie added", "movie": result.data[0]}
+    except Exception as e:
+        print(f"Error adding movie: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.put("/admin/movies/{movie_id}", dependencies=[Depends(require_owner)])
+async def update_movie(movie_id: int, movie: dict):
+    """Update a movie (owner only)"""
+    try:
+        result = supabase_client.table('movies')\
+            .update(movie)\
+            .eq('id', movie_id)\
+            .execute()
+        
+        return {"message": "Movie updated", "movie": result.data[0]}
+    except Exception as e:
+        print(f"Error updating movie: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/admin/movies/{movie_id}", dependencies=[Depends(require_owner)])
+async def delete_movie(movie_id: int):
+    """Delete a movie (owner only)"""
+    try:
+        # Get movie to delete files
+        movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
+        if movie.data:
+            # Delete video file if it exists in uploads
+            video_url = movie.data[0].get('video_url')
+            if video_url and video_url.startswith('/uploads/'):
+                file_path = f".{video_url}"
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            
+            # Delete thumbnail file
+            thumbnail_url = movie.data[0].get('thumbnail')
+            if thumbnail_url and thumbnail_url.startswith('/uploads/'):
+                file_path = f".{thumbnail_url}"
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+        
+        # Delete related data
+        supabase_client.table('comments').delete().eq('movie_id', movie_id).execute()
+        supabase_client.table('ratings').delete().eq('movie_id', movie_id).execute()
+        supabase_client.table('watch_history').delete().eq('movie_id', movie_id).execute()
+        supabase_client.table('watchlist').delete().eq('movie_id', movie_id).execute()
+        supabase_client.table('movies').delete().eq('id', movie_id).execute()
+        
+        return {"message": "Movie deleted"}
+    except Exception as e:
+        print(f"Error deleting movie: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/movies")
 async def get_movies(type: Optional[str] = None, genre: Optional[str] = None, limit: int = 50, offset: int = 0):
@@ -409,244 +565,148 @@ async def rate_movie(movie_id: int, rating: float, user = Depends(require_user))
         raise HTTPException(status_code=400, detail=str(e))
 
 # ============================================
-# COMMUNITY ROUTES (FULLY IMPLEMENTED)
+# GLOBAL CHAT ROOM WITH TAGS
 # ============================================
 
-@app.get("/community/posts")
-async def get_posts(limit: int = 20, offset: int = 0, sort: str = "newest"):
-    """Get all community posts with pagination"""
+@app.get("/chat/messages")
+async def get_chat_messages(limit: int = 50, tag: Optional[str] = None):
+    """Get chat messages, optionally filtered by tag"""
     try:
-        query = supabase_client.table('community_posts')\
-            .select('*, profiles!inner(username, avatar_url)')
+        query = supabase_client.table('chat_messages')\
+            .select('*, profiles!inner(username, avatar_url)')\
+            .order('created_at', desc=True)
         
-        # Apply sorting
-        if sort == "newest":
-            query = query.order('created_at', desc=True)
-        elif sort == "oldest":
-            query = query.order('created_at', asc=True)
-        elif sort == "popular":
-            # This would need a likes count - simplified for now
-            query = query.order('created_at', desc=True)
-        
-        # Get total count
-        count_result = supabase_client.table('community_posts').select('*', count='exact').execute()
-        total_count = len(count_result.data) if count_result.data else 0
-        
-        # Apply pagination
-        posts = query.range(offset, offset + limit - 1).execute()
-        
-        # Add comments count and likes count for each post
-        for post in posts.data:
-            # Get comments count
-            comments = supabase_client.table('comments')\
-                .select('*', count='exact')\
-                .eq('post_id', post['id'])\
-                .execute()
-            post['comments_count'] = len(comments.data) if comments.data else 0
+        if tag:
+            # Filter by tag
+            all_messages = query.execute()
+            filtered = [m for m in all_messages.data if tag in m.get('tags', [])]
             
-            # Get likes count
-            likes = supabase_client.table('likes')\
-                .select('*', count='exact')\
-                .eq('post_id', post['id'])\
-                .execute()
-            post['likes_count'] = len(likes.data) if likes.data else 0
+            messages = []
+            for msg in filtered[:limit]:
+                messages.append({
+                    "id": msg['id'],
+                    "user_id": msg['user_id'],
+                    "username": msg['profiles']['username'],
+                    "avatar_url": msg['profiles'].get('avatar_url'),
+                    "content": msg['content'],
+                    "tags": msg.get('tags', []),
+                    "created_at": msg['created_at']
+                })
+            
+            return {"messages": messages}
         
-        return {
-            "posts": posts.data,
-            "total": total_count,
-            "limit": limit,
-            "offset": offset
-        }
+        result = query.limit(limit).execute()
+        
+        messages = []
+        for msg in result.data:
+            messages.append({
+                "id": msg['id'],
+                "user_id": msg['user_id'],
+                "username": msg['profiles']['username'],
+                "avatar_url": msg['profiles'].get('avatar_url'),
+                "content": msg['content'],
+                "tags": msg.get('tags', []),
+                "created_at": msg['created_at']
+            })
+        
+        return {"messages": messages}
     except Exception as e:
-        print(f"Error fetching posts: {e}")
-        return {"posts": [], "total": 0}
+        print(f"Error fetching chat messages: {e}")
+        return {"messages": []}
 
-@app.get("/community/posts/{post_id}")
-async def get_post(post_id: int):
-    """Get a single post with comments"""
-    try:
-        # Get post
-        post_result = supabase_client.table('community_posts')\
-            .select('*, profiles!inner(username, avatar_url)')\
-            .eq('id', post_id)\
-            .execute()
-        
-        if not post_result.data:
-            raise HTTPException(status_code=404, detail="Post not found")
-        
-        post = post_result.data[0]
-        
-        # Get comments for this post
-        comments = supabase_client.table('comments')\
-            .select('*, profiles!inner(username, avatar_url)')\
-            .eq('post_id', post_id)\
-            .order('created_at', asc=True)\
-            .execute()
-        
-        # Get likes count
-        likes = supabase_client.table('likes')\
-            .select('*', count='exact')\
-            .eq('post_id', post_id)\
-            .execute()
-        post['likes_count'] = len(likes.data) if likes.data else 0
-        
-        return {
-            "post": post,
-            "comments": comments.data
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error fetching post: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/community/posts")
-async def create_post(post: CommunityPost, user = Depends(require_user)):
-    """Create a new community post"""
+@app.post("/chat/messages")
+async def send_chat_message(message: ChatMessage, user = Depends(require_user)):
+    """Send a chat message"""
     try:
         # Generate ID
-        post_id = random.randint(1000, 9999)
+        message_id = random.randint(100000, 999999)
         
-        post_data = {
-            "id": post_id,
+        message_data = {
+            "id": message_id,
             "user_id": user['id'],
-            "username": user['username'],
-            "avatar_url": user.get('avatar_url'),
-            "title": post.title,
-            "content": post.content,
-            "image_url": post.image_url,
+            "content": message.content,
+            "tags": message.tags,
             "created_at": datetime.now().isoformat()
         }
         
-        result = supabase_client.table('community_posts')\
-            .insert(post_data)\
+        result = supabase_client.table('chat_messages')\
+            .insert(message_data)\
             .execute()
         
+        # Get user info for response
         return {
-            "message": "Post created successfully",
-            "post": result.data[0]
+            "message": "Message sent",
+            "chat_message": {
+                "id": result.data[0]['id'],
+                "user_id": user['id'],
+                "username": user['username'],
+                "avatar_url": user.get('avatar_url'),
+                "content": result.data[0]['content'],
+                "tags": result.data[0].get('tags', []),
+                "created_at": result.data[0]['created_at']
+            }
         }
     except Exception as e:
-        print(f"Error creating post: {e}")
+        print(f"Error sending chat message: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.put("/community/posts/{post_id}")
-async def update_post(post_id: int, post_update: CommunityPost, user = Depends(require_user)):
-    """Update a post (only by author or owner)"""
+@app.get("/chat/tags")
+async def get_popular_tags(limit: int = 20):
+    """Get popular chat tags"""
     try:
-        # Check if post exists
-        post = supabase_client.table('community_posts')\
-            .select('*')\
-            .eq('id', post_id)\
+        result = supabase_client.table('chat_messages')\
+            .select('tags')\
             .execute()
         
-        if not post.data:
-            raise HTTPException(status_code=404, detail="Post not found")
+        tag_counts = {}
+        for msg in result.data:
+            for tag in msg.get('tags', []):
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        
+        # Sort by count and return top tags
+        sorted_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+        return {"tags": [{"name": t[0], "count": t[1]} for t in sorted_tags[:limit]]}
+    except Exception as e:
+        print(f"Error fetching tags: {e}")
+        return {"tags": []}
+
+@app.delete("/chat/messages/{message_id}")
+async def delete_chat_message(message_id: int, user = Depends(require_user)):
+    """Delete a chat message (only by author or owner)"""
+    try:
+        # Check if message exists
+        message = supabase_client.table('chat_messages')\
+            .select('*')\
+            .eq('id', message_id)\
+            .execute()
+        
+        if not message.data:
+            raise HTTPException(status_code=404, detail="Message not found")
         
         # Check permissions
-        if post.data[0]['user_id'] != user['id'] and user.get('role') != 'owner':
-            raise HTTPException(status_code=403, detail="You can only edit your own posts")
+        if message.data[0]['user_id'] != user['id'] and user.get('role') != 'owner':
+            raise HTTPException(status_code=403, detail="You can only delete your own messages")
         
-        update_data = {
-            "title": post_update.title,
-            "content": post_update.content,
-            "image_url": post_update.image_url,
-            "updated_at": datetime.now().isoformat()
-        }
-        
-        result = supabase_client.table('community_posts')\
-            .update(update_data)\
-            .eq('id', post_id)\
+        supabase_client.table('chat_messages')\
+            .delete()\
+            .eq('id', message_id)\
             .execute()
         
-        return {
-            "message": "Post updated successfully",
-            "post": result.data[0]
-        }
+        return {"message": "Message deleted"}
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error updating post: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.delete("/community/posts/{post_id}")
-async def delete_post(post_id: int, user = Depends(require_user)):
-    """Delete a post (only by author or owner)"""
-    try:
-        # Check if post exists
-        post = supabase_client.table('community_posts')\
-            .select('*')\
-            .eq('id', post_id)\
-            .execute()
-        
-        if not post.data:
-            raise HTTPException(status_code=404, detail="Post not found")
-        
-        # Check permissions
-        if post.data[0]['user_id'] != user['id'] and user.get('role') != 'owner':
-            raise HTTPException(status_code=403, detail="You can only delete your own posts")
-        
-        # Delete related comments first
-        supabase_client.table('comments').delete().eq('post_id', post_id).execute()
-        
-        # Delete likes
-        supabase_client.table('likes').delete().eq('post_id', post_id).execute()
-        
-        # Delete post
-        supabase_client.table('community_posts').delete().eq('id', post_id).execute()
-        
-        return {"message": "Post deleted successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error deleting post: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/community/posts/{post_id}/like")
-async def like_post(post_id: int, user = Depends(require_user)):
-    """Like or unlike a post"""
-    try:
-        # Check if already liked
-        existing = supabase_client.table('likes')\
-            .select('*')\
-            .eq('user_id', user['id'])\
-            .eq('post_id', post_id)\
-            .execute()
-        
-        if existing.data:
-            # Unlike
-            supabase_client.table('likes')\
-                .delete()\
-                .eq('user_id', user['id'])\
-                .eq('post_id', post_id)\
-                .execute()
-            return {"message": "Post unliked", "liked": False}
-        else:
-            # Like
-            supabase_client.table('likes')\
-                .insert({
-                    "user_id": user['id'],
-                    "post_id": post_id,
-                    "created_at": datetime.now().isoformat()
-                })\
-                .execute()
-            return {"message": "Post liked", "liked": True}
-    except Exception as e:
-        print(f"Error liking post: {e}")
+        print(f"Error deleting message: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 # ============================================
-# COMMENT ROUTES
+# COMMENT ROUTES (FOR MOVIES)
 # ============================================
 
 @app.post("/comments")
 async def add_comment(comment: Comment, user = Depends(require_user)):
-    """Add a comment to a movie or post"""
+    """Add a comment to a movie"""
     try:
-        # Validate that either movie_id or post_id is provided
-        if not comment.movie_id and not comment.post_id:
-            raise HTTPException(status_code=400, detail="Either movie_id or post_id must be provided")
-        
         # Generate ID
         comment_id = random.randint(10000, 99999)
         
@@ -657,7 +717,6 @@ async def add_comment(comment: Comment, user = Depends(require_user)):
             "avatar_url": user.get('avatar_url'),
             "content": comment.content,
             "movie_id": comment.movie_id,
-            "post_id": comment.post_id,
             "created_at": datetime.now().isoformat()
         }
         
@@ -715,7 +774,7 @@ async def get_my_profile(user = Depends(get_optional_user)):
     # Get additional stats
     if user.get('role') == 'owner':
         # Get counts from database
-        posts_count = supabase_client.table('community_posts')\
+        messages_count = supabase_client.table('chat_messages')\
             .select('*', count='exact')\
             .execute()
         users_count = supabase_client.table('profiles')\
@@ -726,13 +785,13 @@ async def get_my_profile(user = Depends(get_optional_user)):
             .execute()
         
         user['stats'] = {
-            "posts": len(posts_count.data) if posts_count.data else 0,
+            "messages": len(messages_count.data) if messages_count.data else 0,
             "users": len(users_count.data) if users_count.data else 0,
             "movies": len(movies_count.data) if movies_count.data else 0
         }
     else:
         # Get user stats
-        posts = supabase_client.table('community_posts')\
+        messages = supabase_client.table('chat_messages')\
             .select('*', count='exact')\
             .eq('user_id', user['id'])\
             .execute()
@@ -742,7 +801,7 @@ async def get_my_profile(user = Depends(get_optional_user)):
             .execute()
         
         user['stats'] = {
-            "posts": len(posts.data) if posts.data else 0,
+            "messages": len(messages.data) if messages.data else 0,
             "comments": len(comments.data) if comments.data else 0
         }
     
@@ -859,7 +918,7 @@ async def remove_from_watchlist(movie_id: int, user = Depends(require_user)):
     return {"message": "Removed from watchlist"}
 
 # ============================================
-# ADMIN ROUTES (OWNER ONLY) - FULLY IMPLEMENTED
+# ADMIN ROUTES (OWNER ONLY)
 # ============================================
 
 @app.get("/admin/stats")
@@ -869,7 +928,7 @@ async def get_admin_stats(owner = Depends(require_owner)):
         # Get counts
         users = supabase_client.table('profiles').select('*', count='exact').execute()
         movies = supabase_client.table('movies').select('*', count='exact').execute()
-        posts = supabase_client.table('community_posts').select('*', count='exact').execute()
+        messages = supabase_client.table('chat_messages').select('*', count='exact').execute()
         comments = supabase_client.table('comments').select('*', count='exact').execute()
         
         # Get recent activity (last 24h)
@@ -878,24 +937,34 @@ async def get_admin_stats(owner = Depends(require_owner)):
             .select('*', count='exact')\
             .gte('created_at', yesterday)\
             .execute()
-        recent_posts = supabase_client.table('community_posts')\
+        recent_messages = supabase_client.table('chat_messages')\
             .select('*', count='exact')\
             .gte('created_at', yesterday)\
             .execute()
         
+        # Get storage info
+        total_video_size = 0
+        if os.path.exists(f"{UPLOAD_DIR}/movies"):
+            for file in os.listdir(f"{UPLOAD_DIR}/movies"):
+                file_path = os.path.join(f"{UPLOAD_DIR}/movies", file)
+                if os.path.isfile(file_path):
+                    total_video_size += os.path.getsize(file_path)
+        
         return {
             "movies": len(movies.data) if movies.data else 0,
             "users": len(users.data) if users.data else 0,
-            "posts": len(posts.data) if posts.data else 0,
+            "messages": len(messages.data) if messages.data else 0,
             "comments": len(comments.data) if comments.data else 0,
             "recent_users": len(recent_users.data) if recent_users.data else 0,
-            "recent_posts": len(recent_posts.data) if recent_posts.data else 0
+            "recent_messages": len(recent_messages.data) if recent_messages.data else 0,
+            "storage_used_gb": round(total_video_size / (1024**3), 2)
         }
     except Exception as e:
         print(f"Error getting stats: {e}")
         return {
-            "movies": 0, "users": 0, "posts": 0, 
-            "comments": 0, "recent_users": 0, "recent_posts": 0
+            "movies": 0, "users": 0, "messages": 0, 
+            "comments": 0, "recent_users": 0, "recent_messages": 0,
+            "storage_used_gb": 0
         }
 
 @app.get("/admin/users")
@@ -908,7 +977,7 @@ async def get_all_users(owner = Depends(require_owner)):
         
         # Add stats for each user
         for user in result.data:
-            posts = supabase_client.table('community_posts')\
+            messages = supabase_client.table('chat_messages')\
                 .select('*', count='exact')\
                 .eq('user_id', user['id'])\
                 .execute()
@@ -918,7 +987,7 @@ async def get_all_users(owner = Depends(require_owner)):
                 .execute()
             
             user['stats'] = {
-                "posts": len(posts.data) if posts.data else 0,
+                "messages": len(messages.data) if messages.data else 0,
                 "comments": len(comments.data) if comments.data else 0
             }
         
@@ -927,83 +996,46 @@ async def get_all_users(owner = Depends(require_owner)):
         print(f"Error fetching users: {e}")
         return {"users": []}
 
-@app.get("/admin/posts")
-async def get_all_posts(owner = Depends(require_owner)):
-    """Get all community posts for moderation"""
+@app.get("/admin/movies")
+async def get_all_movies_admin(owner = Depends(require_owner)):
+    """Get all movies with details for admin"""
     try:
-        result = supabase_client.table('community_posts')\
-            .select('*, profiles!inner(username)')\
+        result = supabase_client.table('movies')\
+            .select('*')\
             .order('created_at', desc=True)\
             .execute()
         
-        return {"posts": result.data}
+        return {"movies": result.data}
     except Exception as e:
-        print(f"Error fetching posts: {e}")
-        return {"posts": []}
+        print(f"Error fetching movies: {e}")
+        return {"movies": []}
 
-@app.delete("/admin/posts/{post_id}")
-async def admin_delete_post(post_id: int, owner = Depends(require_owner)):
-    """Delete any post (admin only)"""
+@app.get("/admin/chat")
+async def get_all_chat_messages(owner = Depends(require_owner), limit: int = 100):
+    """Get all chat messages for admin moderation"""
     try:
-        # Delete related comments first
-        supabase_client.table('comments').delete().eq('post_id', post_id).execute()
-        # Delete likes
-        supabase_client.table('likes').delete().eq('post_id', post_id).execute()
-        # Delete post
-        supabase_client.table('community_posts').delete().eq('id', post_id).execute()
-        
-        return {"message": "Post deleted by admin"}
-    except Exception as e:
-        print(f"Error deleting post: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/admin/movies")
-async def add_movie(movie: Movie, owner = Depends(require_owner)):
-    """Add a new movie"""
-    try:
-        movie_data = movie.dict()
-        movie_data["views"] = 0
-        movie_data["created_at"] = datetime.now().isoformat()
-        
-        result = supabase_client.table('movies')\
-            .insert(movie_data)\
+        result = supabase_client.table('chat_messages')\
+            .select('*, profiles!inner(username, avatar_url)')\
+            .order('created_at', desc=True)\
+            .limit(limit)\
             .execute()
         
-        return {"message": "Movie added", "movie": result.data[0]}
-    except Exception as e:
-        print(f"Error adding movie: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.put("/admin/movies/{movie_id}")
-async def update_movie(movie_id: int, movie: Movie, owner = Depends(require_owner)):
-    """Update a movie"""
-    try:
-        movie_data = movie.dict()
-        result = supabase_client.table('movies')\
-            .update(movie_data)\
-            .eq('id', movie_id)\
-            .execute()
+        messages = []
+        for msg in result.data:
+            messages.append({
+                "id": msg['id'],
+                "user_id": msg['user_id'],
+                "username": msg['profiles']['username'],
+                "avatar_url": msg['profiles'].get('avatar_url'),
+                "content": msg['content'],
+                "tags": msg.get('tags', []),
+                "created_at": msg['created_at']
+            })
         
-        return {"message": "Movie updated", "movie": result.data[0]}
+        return {"messages": messages}
     except Exception as e:
-        print(f"Error updating movie: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.delete("/admin/movies/{movie_id}")
-async def delete_movie(movie_id: int, owner = Depends(require_owner)):
-    """Delete a movie"""
-    try:
-        # Delete related data
-        supabase_client.table('comments').delete().eq('movie_id', movie_id).execute()
-        supabase_client.table('ratings').delete().eq('movie_id', movie_id).execute()
-        supabase_client.table('watch_history').delete().eq('movie_id', movie_id).execute()
-        supabase_client.table('watchlist').delete().eq('movie_id', movie_id).execute()
-        supabase_client.table('movies').delete().eq('id', movie_id).execute()
-        
-        return {"message": "Movie deleted"}
-    except Exception as e:
-        print(f"Error deleting movie: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        print(f"Error fetching chat messages: {e}")
+        return {"messages": []}
 
 @app.post("/admin/users/{user_id}/toggle-role")
 async def toggle_user_role(user_id: str, owner = Depends(require_owner)):
@@ -1036,6 +1068,20 @@ async def toggle_user_role(user_id: str, owner = Depends(require_owner)):
         print(f"Error toggling user role: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.delete("/admin/chat/{message_id}")
+async def admin_delete_chat_message(message_id: int, owner = Depends(require_owner)):
+    """Delete any chat message (admin only)"""
+    try:
+        supabase_client.table('chat_messages')\
+            .delete()\
+            .eq('id', message_id)\
+            .execute()
+        
+        return {"message": "Message deleted by admin"}
+    except Exception as e:
+        print(f"Error deleting message: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
 # ============================================
 # HEALTH CHECK
 # ============================================
@@ -1046,5 +1092,6 @@ async def health_check():
     return {
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "database": "connected"
+        "database": "connected",
+        "uploads": os.path.exists(UPLOAD_DIR)
     }

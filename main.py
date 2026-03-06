@@ -86,6 +86,9 @@ class Comment(BaseModel):
     content: str = Field(..., min_length=1, max_length=1000)
     movie_id: int
 
+class Rating(BaseModel):
+    rating: float = Field(..., ge=0, le=10)
+
 # ============================================
 # AUTH MIDDLEWARE
 # ============================================
@@ -207,8 +210,9 @@ async def register(user: UserSignup):
             "email": email,
             "password": user.password,
             "role": "user",
-            "avatar_url": f"https://ui-avatars.com/api/?name={user.username}&background=ff0000&color=fff&size=128",
+            "avatar_url": f"https://ui-avatars.com/api/?name={user.username}&background=e50914&color=fff&size=128",
             "bio": "",
+            "display_name": user.username,
             "created_at": datetime.now().isoformat()
         }
         
@@ -246,136 +250,8 @@ async def logout():
     return {"message": "Logged out successfully"}
 
 # ============================================
-# MOVIE ROUTES (WITH UPLOADS)
+# MOVIE ROUTES
 # ============================================
-
-@app.post("/admin/movies/upload", dependencies=[Depends(require_owner)])
-async def upload_movie(
-    title: str = Form(...),
-    description: str = Form(...),
-    genre: str = Form(...),
-    release_year: int = Form(...),
-    type: str = Form(...),
-    thumbnail: UploadFile = File(...),
-    video: UploadFile = File(...)
-):
-    """Upload a movie with thumbnail and video file (owner only)"""
-    try:
-        # Validate file types
-        if not thumbnail.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="Thumbnail must be an image")
-        
-        if not video.content_type.startswith('video/'):
-            raise HTTPException(status_code=400, detail="Video must be a video file")
-        
-        # Generate unique filenames
-        thumbnail_filename = f"thumb_{uuid.uuid4()}_{thumbnail.filename}"
-        video_filename = f"video_{uuid.uuid4()}_{video.filename}"
-        
-        thumbnail_path = f"{UPLOAD_DIR}/thumbnails/{thumbnail_filename}"
-        video_path = f"{UPLOAD_DIR}/movies/{video_filename}"
-        
-        # Save files
-        with open(thumbnail_path, "wb") as buffer:
-            shutil.copyfileobj(thumbnail.file, buffer)
-        
-        with open(video_path, "wb") as buffer:
-            shutil.copyfileobj(video.file, buffer)
-        
-        # Create URLs
-        thumbnail_url = f"/uploads/thumbnails/{thumbnail_filename}"
-        video_url = f"/uploads/movies/{video_filename}"
-        
-        # Insert into database
-        movie_data = {
-            "title": title,
-            "description": description,
-            "genre": genre,
-            "release_year": release_year,
-            "type": type,
-            "thumbnail": thumbnail_url,
-            "video_url": video_url,
-            "views": 0,
-            "rating": 0,
-            "created_at": datetime.now().isoformat()
-        }
-        
-        result = supabase_client.table('movies').insert(movie_data).execute()
-        
-        return {
-            "message": "Movie uploaded successfully",
-            "movie": result.data[0]
-        }
-        
-    except Exception as e:
-        print(f"Error uploading movie: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/admin/movies", dependencies=[Depends(require_owner)])
-async def add_movie(movie: Movie):
-    """Add a movie with URL (owner only)"""
-    try:
-        movie_data = movie.dict()
-        movie_data["views"] = 0
-        movie_data["rating"] = 0
-        movie_data["created_at"] = datetime.now().isoformat()
-        
-        result = supabase_client.table('movies').insert(movie_data).execute()
-        
-        return {"message": "Movie added", "movie": result.data[0]}
-    except Exception as e:
-        print(f"Error adding movie: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.put("/admin/movies/{movie_id}", dependencies=[Depends(require_owner)])
-async def update_movie(movie_id: int, movie: MovieUpdate):
-    """Update a movie (owner only)"""
-    try:
-        # Filter out None values
-        update_data = {k: v for k, v in movie.dict().items() if v is not None}
-        
-        result = supabase_client.table('movies')\
-            .update(update_data)\
-            .eq('id', movie_id)\
-            .execute()
-        
-        return {"message": "Movie updated", "movie": result.data[0]}
-    except Exception as e:
-        print(f"Error updating movie: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.delete("/admin/movies/{movie_id}", dependencies=[Depends(require_owner)])
-async def delete_movie(movie_id: int):
-    """Delete a movie (owner only)"""
-    try:
-        # Get movie to delete files
-        movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
-        if movie.data:
-            # Delete video file if it exists in uploads
-            video_url = movie.data[0].get('video_url')
-            if video_url and video_url.startswith('/uploads/'):
-                file_path = f".{video_url}"
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            
-            # Delete thumbnail file
-            thumbnail_url = movie.data[0].get('thumbnail')
-            if thumbnail_url and thumbnail_url.startswith('/uploads/'):
-                file_path = f".{thumbnail_url}"
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-        
-        # Delete related data
-        supabase_client.table('comments').delete().eq('movie_id', movie_id).execute()
-        supabase_client.table('ratings').delete().eq('movie_id', movie_id).execute()
-        supabase_client.table('watch_history').delete().eq('movie_id', movie_id).execute()
-        supabase_client.table('watchlist').delete().eq('movie_id', movie_id).execute()
-        supabase_client.table('movies').delete().eq('id', movie_id).execute()
-        
-        return {"message": "Movie deleted"}
-    except Exception as e:
-        print(f"Error deleting movie: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/movies")
 async def get_movies(type: Optional[str] = None, genre: Optional[str] = None, limit: int = 50, offset: int = 0):
@@ -386,14 +262,15 @@ async def get_movies(type: Optional[str] = None, genre: Optional[str] = None, li
         if type:
             query = query.eq('type', type)
         if genre and genre != 'all':
-            query = query.contains('genre', genre)
+            # Use ILIKE for text search instead of contains operator
+            query = query.ilike('genre', f'%{genre}%')
         
         # Get total count
         count_query = supabase_client.table('movies').select('*', count='exact')
         if type:
             count_query = count_query.eq('type', type)
         if genre and genre != 'all':
-            count_query = count_query.contains('genre', genre)
+            count_query = count_query.ilike('genre', f'%{genre}%')
         
         count_result = count_query.execute()
         total_count = len(count_result.data) if count_result.data else 0
@@ -437,6 +314,7 @@ async def get_genres():
         genres = set()
         for movie in result.data:
             if movie.get('genre'):
+                # Split comma-separated genres
                 for g in movie['genre'].split(','):
                     genres.add(g.strip())
         return {"genres": sorted(list(genres))}
@@ -459,7 +337,7 @@ async def get_trending_movies(limit: int = 10):
         return {"movies": []}
 
 @app.get("/movies/{movie_id}")
-async def get_movie(movie_id: int):
+async def get_movie(movie_id: int, user = Depends(get_optional_user)):
     """Get movie details by ID"""
     try:
         result = supabase_client.table('movies')\
@@ -478,17 +356,17 @@ async def get_movie(movie_id: int):
             .eq('id', movie_id)\
             .execute()
         
-        # Get comments for this movie
-        comments = supabase_client.table('comments')\
+        # Get comments for this movie with user info
+        comments_result = supabase_client.table('comments')\
             .select('*, profiles!inner(username, avatar_url)')\
             .eq('movie_id', movie_id)\
             .order('created_at', desc=True)\
             .execute()
         
         # Format comments
-        formatted_comments = []
-        for comment in comments.data:
-            formatted_comments.append({
+        comments = []
+        for comment in comments_result.data:
+            comments.append({
                 "id": comment['id'],
                 "user_id": comment['user_id'],
                 "username": comment['profiles']['username'],
@@ -503,16 +381,28 @@ async def get_movie(movie_id: int):
             first_genre = movie['genre'].split(',')[0].strip()
             similar_result = supabase_client.table('movies')\
                 .select('*')\
-                .contains('genre', first_genre)\
+                .ilike('genre', f'%{first_genre}%')\
                 .neq('id', movie_id)\
                 .limit(6)\
                 .execute()
             similar = similar_result.data
         
+        # Check if user has rated this movie
+        user_rating = None
+        if user:
+            rating_result = supabase_client.table('ratings')\
+                .select('rating')\
+                .eq('user_id', user['id'])\
+                .eq('movie_id', movie_id)\
+                .execute()
+            if rating_result.data:
+                user_rating = rating_result.data[0]['rating']
+        
         return {
             "movie": movie,
-            "comments": formatted_comments,
-            "similar": similar
+            "comments": comments,
+            "similar": similar,
+            "user_rating": user_rating
         }
         
     except HTTPException:
@@ -522,12 +412,13 @@ async def get_movie(movie_id: int):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/movies/{movie_id}/rate")
-async def rate_movie(movie_id: int, rating: float, user = Depends(require_user)):
+async def rate_movie(movie_id: int, rating: Rating, user = Depends(require_user)):
     """Rate a movie"""
     try:
-        # Validate rating
-        if rating < 0 or rating > 10:
-            raise HTTPException(status_code=400, detail="Rating must be between 0 and 10")
+        # Check if movie exists
+        movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
+        if not movie.data:
+            raise HTTPException(status_code=404, detail="Movie not found")
         
         # Check if already rated
         existing = supabase_client.table('ratings')\
@@ -539,7 +430,7 @@ async def rate_movie(movie_id: int, rating: float, user = Depends(require_user))
         if existing.data:
             # Update
             supabase_client.table('ratings')\
-                .update({"rating": rating, "updated_at": datetime.now().isoformat()})\
+                .update({"rating": rating.rating, "updated_at": datetime.now().isoformat()})\
                 .eq('id', existing.data[0]['id'])\
                 .execute()
         else:
@@ -548,7 +439,7 @@ async def rate_movie(movie_id: int, rating: float, user = Depends(require_user))
                 .insert({
                     "user_id": user['id'],
                     "movie_id": movie_id,
-                    "rating": rating,
+                    "rating": rating.rating,
                     "created_at": datetime.now().isoformat()
                 })\
                 .execute()
@@ -572,7 +463,321 @@ async def rate_movie(movie_id: int, rating: float, user = Depends(require_user))
         raise HTTPException(status_code=400, detail=str(e))
 
 # ============================================
-# GLOBAL CHAT ROOM WITH TAGS
+# WATCH HISTORY ROUTES
+# ============================================
+
+@app.get("/user/history")
+async def get_watch_history(user = Depends(require_user)):
+    """Get user's watch history"""
+    try:
+        result = supabase_client.table('watch_history')\
+            .select('*, movies(*)')\
+            .eq('user_id', user['id'])\
+            .order('last_watched', desc=True)\
+            .execute()
+        
+        history = []
+        for item in result.data:
+            if item.get('movies'):
+                history.append({
+                    "id": item['id'],
+                    "movie_id": item['movie_id'],
+                    "progress": item['progress'],
+                    "completed": item['completed'],
+                    "last_watched": item['last_watched'],
+                    "movie": item['movies']
+                })
+        
+        return {"history": history}
+    except Exception as e:
+        print(f"Error fetching history: {e}")
+        return {"history": []}
+
+@app.post("/user/history/{movie_id}")
+async def add_to_history(movie_id: int, progress: int = 0, completed: bool = False, user = Depends(require_user)):
+    """Add movie to watch history"""
+    try:
+        # Check if movie exists
+        movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
+        if not movie.data:
+            raise HTTPException(status_code=404, detail="Movie not found")
+        
+        # Check if exists
+        existing = supabase_client.table('watch_history')\
+            .select('*')\
+            .eq('user_id', user['id'])\
+            .eq('movie_id', movie_id)\
+            .execute()
+        
+        if existing.data:
+            # Update
+            supabase_client.table('watch_history')\
+                .update({
+                    "progress": progress,
+                    "completed": completed or progress >= 90,
+                    "last_watched": datetime.now().isoformat()
+                })\
+                .eq('id', existing.data[0]['id'])\
+                .execute()
+        else:
+            # Insert
+            supabase_client.table('watch_history')\
+                .insert({
+                    "user_id": user['id'],
+                    "movie_id": movie_id,
+                    "progress": progress,
+                    "completed": completed or progress >= 90,
+                    "last_watched": datetime.now().isoformat()
+                })\
+                .execute()
+        
+        return {"message": "History updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating history: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ============================================
+# WATCHLIST ROUTES
+# ============================================
+
+@app.get("/user/watchlist")
+async def get_watchlist(user = Depends(require_user)):
+    """Get user's watchlist"""
+    try:
+        result = supabase_client.table('watchlist')\
+            .select('*, movies(*)')\
+            .eq('user_id', user['id'])\
+            .order('added_at', desc=True)\
+            .execute()
+        
+        watchlist = []
+        for item in result.data:
+            if item.get('movies'):
+                watchlist.append(item['movies'])
+        
+        return {"watchlist": watchlist}
+    except Exception as e:
+        print(f"Error fetching watchlist: {e}")
+        return {"watchlist": []}
+
+@app.post("/user/watchlist/{movie_id}")
+async def add_to_watchlist(movie_id: int, user = Depends(require_user)):
+    """Add movie to watchlist"""
+    try:
+        # Check if movie exists
+        movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
+        if not movie.data:
+            raise HTTPException(status_code=404, detail="Movie not found")
+        
+        # Check if already in watchlist
+        existing = supabase_client.table('watchlist')\
+            .select('*')\
+            .eq('user_id', user['id'])\
+            .eq('movie_id', movie_id)\
+            .execute()
+        
+        if existing.data:
+            return {"message": "Already in watchlist"}
+        
+        supabase_client.table('watchlist')\
+            .insert({
+                "user_id": user['id'],
+                "movie_id": movie_id,
+                "added_at": datetime.now().isoformat()
+            })\
+            .execute()
+        
+        return {"message": "Added to watchlist"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error adding to watchlist: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/user/watchlist/{movie_id}")
+async def remove_from_watchlist(movie_id: int, user = Depends(require_user)):
+    """Remove movie from watchlist"""
+    try:
+        supabase_client.table('watchlist')\
+            .delete()\
+            .eq('user_id', user['id'])\
+            .eq('movie_id', movie_id)\
+            .execute()
+        
+        return {"message": "Removed from watchlist"}
+    except Exception as e:
+        print(f"Error removing from watchlist: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ============================================
+# PROFILE ROUTES
+# ============================================
+
+@app.get("/user/profile")
+async def get_my_profile(user = Depends(get_optional_user)):
+    """Get current user profile with stats"""
+    if not user:
+        return {"profile": None}
+    
+    try:
+        # Get user from database to ensure latest data
+        db_user = supabase_client.table('profiles')\
+            .select('*')\
+            .eq('id', user['id'])\
+            .execute()
+        
+        if not db_user.data:
+            return {"profile": None}
+        
+        profile = db_user.data[0]
+        profile.pop('password', None)
+        
+        # Get counts for stats
+        if profile.get('role') == 'owner':
+            # Owner sees platform stats
+            movies_count = supabase_client.table('movies').select('*', count='exact').execute()
+            users_count = supabase_client.table('profiles').select('*', count='exact').execute()
+            messages_count = supabase_client.table('chat_messages').select('*', count='exact').execute()
+            
+            profile['stats'] = {
+                "movies": len(movies_count.data) if movies_count.data else 0,
+                "users": len(users_count.data) if users_count.data else 0,
+                "messages": len(messages_count.data) if messages_count.data else 0,
+                "watchlist": 0,
+                "history": 0,
+                "comments": 0
+            }
+        else:
+            # Regular user sees personal stats
+            watchlist = supabase_client.table('watchlist')\
+                .select('*', count='exact')\
+                .eq('user_id', user['id'])\
+                .execute()
+            
+            history = supabase_client.table('watch_history')\
+                .select('*', count='exact')\
+                .eq('user_id', user['id'])\
+                .execute()
+            
+            comments = supabase_client.table('comments')\
+                .select('*', count='exact')\
+                .eq('user_id', user['id'])\
+                .execute()
+            
+            profile['stats'] = {
+                "watchlist": len(watchlist.data) if watchlist.data else 0,
+                "history": len(history.data) if history.data else 0,
+                "comments": len(comments.data) if comments.data else 0,
+                "messages": 0,
+                "movies": 0,
+                "users": 0
+            }
+        
+        return {"profile": profile}
+    except Exception as e:
+        print(f"Error fetching profile: {e}")
+        return {"profile": user}
+
+@app.put("/user/profile")
+async def update_profile(update: UserProfileUpdate, user = Depends(require_user)):
+    """Update user profile"""
+    try:
+        update_data = {}
+        if update.display_name:
+            update_data['display_name'] = update.display_name
+        if update.avatar_url:
+            update_data['avatar_url'] = update.avatar_url
+        if update.bio is not None:
+            update_data['bio'] = update.bio
+        
+        update_data['updated_at'] = datetime.now().isoformat()
+        
+        result = supabase_client.table('profiles')\
+            .update(update_data)\
+            .eq('id', user['id'])\
+            .execute()
+        
+        updated = result.data[0]
+        updated.pop('password', None)
+        
+        return {"message": "Profile updated", "profile": updated}
+    except Exception as e:
+        print(f"Error updating profile: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ============================================
+# COMMENT ROUTES
+# ============================================
+
+@app.post("/comments")
+async def add_comment(comment: Comment, user = Depends(require_user)):
+    """Add a comment to a movie"""
+    try:
+        # Check if movie exists
+        movie = supabase_client.table('movies').select('*').eq('id', comment.movie_id).execute()
+        if not movie.data:
+            raise HTTPException(status_code=404, detail="Movie not found")
+        
+        # Generate ID
+        comment_id = random.randint(10000, 99999)
+        
+        comment_data = {
+            "id": comment_id,
+            "user_id": user['id'],
+            "username": user['username'],
+            "avatar_url": user.get('avatar_url'),
+            "content": comment.content,
+            "movie_id": comment.movie_id,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = supabase_client.table('comments')\
+            .insert(comment_data)\
+            .execute()
+        
+        return {
+            "message": "Comment added successfully",
+            "comment": result.data[0]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error adding comment: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/comments/{comment_id}")
+async def delete_comment(comment_id: int, user = Depends(require_user)):
+    """Delete a comment (only by author or owner)"""
+    try:
+        # Check if comment exists
+        comment = supabase_client.table('comments')\
+            .select('*')\
+            .eq('id', comment_id)\
+            .execute()
+        
+        if not comment.data:
+            raise HTTPException(status_code=404, detail="Comment not found")
+        
+        # Check permissions
+        if comment.data[0]['user_id'] != user['id'] and user.get('role') != 'owner':
+            raise HTTPException(status_code=403, detail="You can only delete your own comments")
+        
+        supabase_client.table('comments')\
+            .delete()\
+            .eq('id', comment_id)\
+            .execute()
+        
+        return {"message": "Comment deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error deleting comment: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ============================================
+# CHAT ROUTES
 # ============================================
 
 @app.get("/chat/messages")
@@ -706,266 +911,73 @@ async def delete_chat_message(message_id: int, user = Depends(require_user)):
         raise HTTPException(status_code=400, detail=str(e))
 
 # ============================================
-# COMMENT ROUTES (FOR MOVIES)
-# ============================================
-
-@app.post("/comments")
-async def add_comment(comment: Comment, user = Depends(require_user)):
-    """Add a comment to a movie"""
-    try:
-        # Check if movie exists
-        movie = supabase_client.table('movies').select('*').eq('id', comment.movie_id).execute()
-        if not movie.data:
-            raise HTTPException(status_code=404, detail="Movie not found")
-        
-        # Generate ID
-        comment_id = random.randint(10000, 99999)
-        
-        comment_data = {
-            "id": comment_id,
-            "user_id": user['id'],
-            "username": user['username'],
-            "avatar_url": user.get('avatar_url'),
-            "content": comment.content,
-            "movie_id": comment.movie_id,
-            "created_at": datetime.now().isoformat()
-        }
-        
-        result = supabase_client.table('comments')\
-            .insert(comment_data)\
-            .execute()
-        
-        return {
-            "message": "Comment added successfully",
-            "comment": result.data[0]
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error adding comment: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.delete("/comments/{comment_id}")
-async def delete_comment(comment_id: int, user = Depends(require_user)):
-    """Delete a comment (only by author or owner)"""
-    try:
-        # Check if comment exists
-        comment = supabase_client.table('comments')\
-            .select('*')\
-            .eq('id', comment_id)\
-            .execute()
-        
-        if not comment.data:
-            raise HTTPException(status_code=404, detail="Comment not found")
-        
-        # Check permissions
-        if comment.data[0]['user_id'] != user['id'] and user.get('role') != 'owner':
-            raise HTTPException(status_code=403, detail="You can only delete your own comments")
-        
-        supabase_client.table('comments')\
-            .delete()\
-            .eq('id', comment_id)\
-            .execute()
-        
-        return {"message": "Comment deleted successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error deleting comment: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-# ============================================
-# USER PROFILE ROUTES
-# ============================================
-
-@app.get("/user/profile")
-async def get_my_profile(user = Depends(get_optional_user)):
-    """Get current user profile"""
-    if not user:
-        return {"profile": None}
-    
-    # Get additional stats
-    if user.get('role') == 'owner':
-        # Get counts from database
-        messages_count = supabase_client.table('chat_messages')\
-            .select('*', count='exact')\
-            .execute()
-        users_count = supabase_client.table('profiles')\
-            .select('*', count='exact')\
-            .execute()
-        movies_count = supabase_client.table('movies')\
-            .select('*', count='exact')\
-            .execute()
-        
-        user['stats'] = {
-            "messages": len(messages_count.data) if messages_count.data else 0,
-            "users": len(users_count.data) if users_count.data else 0,
-            "movies": len(movies_count.data) if movies_count.data else 0
-        }
-    else:
-        # Get user stats
-        messages = supabase_client.table('chat_messages')\
-            .select('*', count='exact')\
-            .eq('user_id', user['id'])\
-            .execute()
-        comments = supabase_client.table('comments')\
-            .select('*', count='exact')\
-            .eq('user_id', user['id'])\
-            .execute()
-        
-        user['stats'] = {
-            "messages": len(messages.data) if messages.data else 0,
-            "comments": len(comments.data) if comments.data else 0
-        }
-    
-    return {"profile": user}
-
-@app.put("/user/profile")
-async def update_profile(update: UserProfileUpdate, user = Depends(require_user)):
-    """Update user profile"""
-    update_data = {}
-    if update.display_name:
-        update_data['display_name'] = update.display_name
-    if update.avatar_url:
-        update_data['avatar_url'] = update.avatar_url
-    if update.bio is not None:
-        update_data['bio'] = update.bio
-    
-    update_data['updated_at'] = datetime.now().isoformat()
-    
-    result = supabase_client.table('profiles')\
-        .update(update_data)\
-        .eq('id', user['id'])\
-        .execute()
-    
-    updated = result.data[0]
-    updated.pop('password', None)
-    
-    return {"message": "Profile updated", "profile": updated}
-
-@app.get("/user/history")
-async def get_watch_history(user = Depends(require_user)):
-    """Get user's watch history"""
-    result = supabase_client.table('watch_history')\
-        .select('*, movies(*)')\
-        .eq('user_id', user['id'])\
-        .order('last_watched', desc=True)\
-        .execute()
-    
-    history = []
-    for item in result.data:
-        if item.get('movies'):
-            movie = item['movies']
-            history.append({
-                "id": item['id'],
-                "movie_id": item['movie_id'],
-                "progress": item['progress'],
-                "completed": item['completed'],
-                "last_watched": item['last_watched'],
-                "movie": movie
-            })
-    
-    return {"history": history}
-
-@app.post("/user/history/{movie_id}")
-async def add_to_history(movie_id: int, progress: int = 0, user = Depends(require_user)):
-    """Add movie to watch history"""
-    # Check if movie exists
-    movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
-    if not movie.data:
-        raise HTTPException(status_code=404, detail="Movie not found")
-    
-    # Check if exists
-    existing = supabase_client.table('watch_history')\
-        .select('*')\
-        .eq('user_id', user['id'])\
-        .eq('movie_id', movie_id)\
-        .execute()
-    
-    if existing.data:
-        # Update
-        supabase_client.table('watch_history')\
-            .update({
-                "progress": progress,
-                "completed": progress >= 90,  # Mark as completed if progress > 90%
-                "last_watched": datetime.now().isoformat()
-            })\
-            .eq('id', existing.data[0]['id'])\
-            .execute()
-    else:
-        # Insert
-        supabase_client.table('watch_history')\
-            .insert({
-                "user_id": user['id'],
-                "movie_id": movie_id,
-                "progress": progress,
-                "completed": progress >= 90,
-                "last_watched": datetime.now().isoformat()
-            })\
-            .execute()
-    
-    return {"message": "History updated"}
-
-@app.get("/user/watchlist")
-async def get_watchlist(user = Depends(require_user)):
-    """Get user's watchlist"""
-    result = supabase_client.table('watchlist')\
-        .select('*, movies(*)')\
-        .eq('user_id', user['id'])\
-        .execute()
-    
-    watchlist = []
-    for item in result.data:
-        if item.get('movies'):
-            watchlist.append(item['movies'])
-    
-    return {"watchlist": watchlist}
-
-@app.post("/user/watchlist/{movie_id}")
-async def add_to_watchlist(movie_id: int, user = Depends(require_user)):
-    """Add movie to watchlist"""
-    # Check if movie exists
-    movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
-    if not movie.data:
-        raise HTTPException(status_code=404, detail="Movie not found")
-    
-    # Check if already in watchlist
-    existing = supabase_client.table('watchlist')\
-        .select('*')\
-        .eq('user_id', user['id'])\
-        .eq('movie_id', movie_id)\
-        .execute()
-    
-    if existing.data:
-        return {"message": "Already in watchlist"}
-    
-    supabase_client.table('watchlist')\
-        .insert({
-            "user_id": user['id'],
-            "movie_id": movie_id,
-            "added_at": datetime.now().isoformat()
-        })\
-        .execute()
-    
-    return {"message": "Added to watchlist"}
-
-@app.delete("/user/watchlist/{movie_id}")
-async def remove_from_watchlist(movie_id: int, user = Depends(require_user)):
-    """Remove movie from watchlist"""
-    supabase_client.table('watchlist')\
-        .delete()\
-        .eq('user_id', user['id'])\
-        .eq('movie_id', movie_id)\
-        .execute()
-    
-    return {"message": "Removed from watchlist"}
-
-# ============================================
 # ADMIN ROUTES (OWNER ONLY)
 # ============================================
 
-@app.get("/admin/stats")
-async def get_admin_stats(owner = Depends(require_owner)):
+@app.post("/admin/movies/upload", dependencies=[Depends(require_owner)])
+async def upload_movie(
+    title: str = Form(...),
+    description: str = Form(...),
+    genre: str = Form(...),
+    release_year: int = Form(...),
+    type: str = Form(...),
+    thumbnail: UploadFile = File(...),
+    video: UploadFile = File(...)
+):
+    """Upload a movie with thumbnail and video file (owner only)"""
+    try:
+        # Validate file types
+        if not thumbnail.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="Thumbnail must be an image")
+        
+        if not video.content_type.startswith('video/'):
+            raise HTTPException(status_code=400, detail="Video must be a video file")
+        
+        # Generate unique filenames
+        thumbnail_filename = f"thumb_{uuid.uuid4()}_{thumbnail.filename}"
+        video_filename = f"video_{uuid.uuid4()}_{video.filename}"
+        
+        thumbnail_path = f"{UPLOAD_DIR}/thumbnails/{thumbnail_filename}"
+        video_path = f"{UPLOAD_DIR}/movies/{video_filename}"
+        
+        # Save files
+        with open(thumbnail_path, "wb") as buffer:
+            shutil.copyfileobj(thumbnail.file, buffer)
+        
+        with open(video_path, "wb") as buffer:
+            shutil.copyfileobj(video.file, buffer)
+        
+        # Create URLs
+        thumbnail_url = f"/uploads/thumbnails/{thumbnail_filename}"
+        video_url = f"/uploads/movies/{video_filename}"
+        
+        # Insert into database
+        movie_data = {
+            "title": title,
+            "description": description,
+            "genre": genre,
+            "release_year": release_year,
+            "type": type,
+            "thumbnail": thumbnail_url,
+            "video_url": video_url,
+            "views": 0,
+            "rating": 0,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = supabase_client.table('movies').insert(movie_data).execute()
+        
+        return {
+            "message": "Movie uploaded successfully",
+            "movie": result.data[0]
+        }
+        
+    except Exception as e:
+        print(f"Error uploading movie: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/admin/stats", dependencies=[Depends(require_owner)])
+async def get_admin_stats():
     """Get platform statistics"""
     try:
         # Get counts
@@ -1013,37 +1025,22 @@ async def get_admin_stats(owner = Depends(require_owner)):
             "storage_used_gb": 0, "video_files": 0
         }
 
-@app.get("/admin/users")
-async def get_all_users(owner = Depends(require_owner)):
+@app.get("/admin/users", dependencies=[Depends(require_owner)])
+async def get_all_users():
     """Get all users with details"""
     try:
         result = supabase_client.table('profiles')\
             .select('id, username, email, role, avatar_url, created_at, last_login')\
+            .order('created_at', desc=True)\
             .execute()
-        
-        # Add stats for each user
-        for user in result.data:
-            messages = supabase_client.table('chat_messages')\
-                .select('*', count='exact')\
-                .eq('user_id', user['id'])\
-                .execute()
-            comments = supabase_client.table('comments')\
-                .select('*', count='exact')\
-                .eq('user_id', user['id'])\
-                .execute()
-            
-            user['stats'] = {
-                "messages": len(messages.data) if messages.data else 0,
-                "comments": len(comments.data) if comments.data else 0
-            }
         
         return {"users": result.data}
     except Exception as e:
         print(f"Error fetching users: {e}")
         return {"users": []}
 
-@app.get("/admin/movies")
-async def get_all_movies_admin(owner = Depends(require_owner)):
+@app.get("/admin/movies", dependencies=[Depends(require_owner)])
+async def get_all_movies_admin():
     """Get all movies with details for admin"""
     try:
         result = supabase_client.table('movies')\
@@ -1056,8 +1053,8 @@ async def get_all_movies_admin(owner = Depends(require_owner)):
         print(f"Error fetching movies: {e}")
         return {"movies": []}
 
-@app.get("/admin/chat")
-async def get_all_chat_messages(owner = Depends(require_owner), limit: int = 100):
+@app.get("/admin/chat", dependencies=[Depends(require_owner)])
+async def get_all_chat_messages(limit: int = 100):
     """Get all chat messages for admin moderation"""
     try:
         result = supabase_client.table('chat_messages')\
@@ -1083,8 +1080,8 @@ async def get_all_chat_messages(owner = Depends(require_owner), limit: int = 100
         print(f"Error fetching chat messages: {e}")
         return {"messages": []}
 
-@app.post("/admin/users/{user_id}/toggle-role")
-async def toggle_user_role(user_id: str, owner = Depends(require_owner)):
+@app.post("/admin/users/{user_id}/toggle-role", dependencies=[Depends(require_owner)])
+async def toggle_user_role(user_id: str):
     """Toggle user role (ban/unban)"""
     try:
         # Get current user
@@ -1114,8 +1111,41 @@ async def toggle_user_role(user_id: str, owner = Depends(require_owner)):
         print(f"Error toggling user role: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.delete("/admin/chat/{message_id}")
-async def admin_delete_chat_message(message_id: int, owner = Depends(require_owner)):
+@app.delete("/admin/movies/{movie_id}", dependencies=[Depends(require_owner)])
+async def delete_movie_admin(movie_id: int):
+    """Delete a movie (admin only)"""
+    try:
+        # Get movie to delete files
+        movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
+        if movie.data:
+            # Delete video file if it exists in uploads
+            video_url = movie.data[0].get('video_url')
+            if video_url and video_url.startswith('/uploads/'):
+                file_path = f".{video_url}"
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            
+            # Delete thumbnail file
+            thumbnail_url = movie.data[0].get('thumbnail')
+            if thumbnail_url and thumbnail_url.startswith('/uploads/'):
+                file_path = f".{thumbnail_url}"
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+        
+        # Delete related data
+        supabase_client.table('comments').delete().eq('movie_id', movie_id).execute()
+        supabase_client.table('ratings').delete().eq('movie_id', movie_id).execute()
+        supabase_client.table('watch_history').delete().eq('movie_id', movie_id).execute()
+        supabase_client.table('watchlist').delete().eq('movie_id', movie_id).execute()
+        supabase_client.table('movies').delete().eq('id', movie_id).execute()
+        
+        return {"message": "Movie deleted"}
+    except Exception as e:
+        print(f"Error deleting movie: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/admin/chat/{message_id}", dependencies=[Depends(require_owner)])
+async def admin_delete_chat_message(message_id: int):
     """Delete any chat message (admin only)"""
     try:
         supabase_client.table('chat_messages')\

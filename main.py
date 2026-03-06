@@ -60,8 +60,7 @@ class UserProfileUpdate(BaseModel):
     avatar_url: Optional[str] = None
     bio: Optional[str] = None
 
-class MovieResponse(BaseModel):
-    id: int
+class Movie(BaseModel):
     title: str
     description: str
     genre: str
@@ -69,22 +68,19 @@ class MovieResponse(BaseModel):
     type: str
     thumbnail: str
     video_url: str
-    views: int
-    rating: float
-    created_at: str
+
+class MovieUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    genre: Optional[str] = None
+    release_year: Optional[int] = None
+    type: Optional[str] = None
+    thumbnail: Optional[str] = None
+    video_url: Optional[str] = None
 
 class ChatMessage(BaseModel):
     content: str = Field(..., min_length=1, max_length=500)
     tags: List[str] = []
-
-class ChatMessageResponse(BaseModel):
-    id: int
-    user_id: str
-    username: str
-    avatar_url: Optional[str]
-    content: str
-    tags: List[str]
-    created_at: str
 
 class Comment(BaseModel):
     content: str = Field(..., min_length=1, max_length=1000)
@@ -316,21 +312,13 @@ async def upload_movie(
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/admin/movies", dependencies=[Depends(require_owner)])
-async def add_movie(movie: dict):
+async def add_movie(movie: Movie):
     """Add a movie with URL (owner only)"""
     try:
-        movie_data = {
-            "title": movie.get("title"),
-            "description": movie.get("description"),
-            "genre": movie.get("genre"),
-            "release_year": movie.get("release_year"),
-            "type": movie.get("type"),
-            "thumbnail": movie.get("thumbnail"),
-            "video_url": movie.get("video_url"),
-            "views": 0,
-            "rating": 0,
-            "created_at": datetime.now().isoformat()
-        }
+        movie_data = movie.dict()
+        movie_data["views"] = 0
+        movie_data["rating"] = 0
+        movie_data["created_at"] = datetime.now().isoformat()
         
         result = supabase_client.table('movies').insert(movie_data).execute()
         
@@ -340,11 +328,14 @@ async def add_movie(movie: dict):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.put("/admin/movies/{movie_id}", dependencies=[Depends(require_owner)])
-async def update_movie(movie_id: int, movie: dict):
+async def update_movie(movie_id: int, movie: MovieUpdate):
     """Update a movie (owner only)"""
     try:
+        # Filter out None values
+        update_data = {k: v for k, v in movie.dict().items() if v is not None}
+        
         result = supabase_client.table('movies')\
-            .update(movie)\
+            .update(update_data)\
             .eq('id', movie_id)\
             .execute()
         
@@ -494,6 +485,18 @@ async def get_movie(movie_id: int):
             .order('created_at', desc=True)\
             .execute()
         
+        # Format comments
+        formatted_comments = []
+        for comment in comments.data:
+            formatted_comments.append({
+                "id": comment['id'],
+                "user_id": comment['user_id'],
+                "username": comment['profiles']['username'],
+                "avatar_url": comment['profiles'].get('avatar_url'),
+                "content": comment['content'],
+                "created_at": comment['created_at']
+            })
+        
         # Get similar movies (by genre)
         similar = []
         if movie.get('genre'):
@@ -508,7 +511,7 @@ async def get_movie(movie_id: int):
         
         return {
             "movie": movie,
-            "comments": comments.data if comments.data else [],
+            "comments": formatted_comments,
             "similar": similar
         }
         
@@ -522,6 +525,10 @@ async def get_movie(movie_id: int):
 async def rate_movie(movie_id: int, rating: float, user = Depends(require_user)):
     """Rate a movie"""
     try:
+        # Validate rating
+        if rating < 0 or rating > 10:
+            raise HTTPException(status_code=400, detail="Rating must be between 0 and 10")
+        
         # Check if already rated
         existing = supabase_client.table('ratings')\
             .select('*')\
@@ -577,7 +584,7 @@ async def get_chat_messages(limit: int = 50, tag: Optional[str] = None):
             .order('created_at', desc=True)
         
         if tag:
-            # Filter by tag
+            # Get all messages and filter by tag
             all_messages = query.execute()
             filtered = [m for m in all_messages.data if tag in m.get('tags', [])]
             
@@ -633,7 +640,6 @@ async def send_chat_message(message: ChatMessage, user = Depends(require_user)):
             .insert(message_data)\
             .execute()
         
-        # Get user info for response
         return {
             "message": "Message sent",
             "chat_message": {
@@ -707,6 +713,11 @@ async def delete_chat_message(message_id: int, user = Depends(require_user)):
 async def add_comment(comment: Comment, user = Depends(require_user)):
     """Add a comment to a movie"""
     try:
+        # Check if movie exists
+        movie = supabase_client.table('movies').select('*').eq('id', comment.movie_id).execute()
+        if not movie.data:
+            raise HTTPException(status_code=404, detail="Movie not found")
+        
         # Generate ID
         comment_id = random.randint(10000, 99999)
         
@@ -728,6 +739,8 @@ async def add_comment(comment: Comment, user = Depends(require_user)):
             "message": "Comment added successfully",
             "comment": result.data[0]
         }
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error adding comment: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -839,11 +852,29 @@ async def get_watch_history(user = Depends(require_user)):
         .order('last_watched', desc=True)\
         .execute()
     
-    return {"history": result.data}
+    history = []
+    for item in result.data:
+        if item.get('movies'):
+            movie = item['movies']
+            history.append({
+                "id": item['id'],
+                "movie_id": item['movie_id'],
+                "progress": item['progress'],
+                "completed": item['completed'],
+                "last_watched": item['last_watched'],
+                "movie": movie
+            })
+    
+    return {"history": history}
 
 @app.post("/user/history/{movie_id}")
 async def add_to_history(movie_id: int, progress: int = 0, user = Depends(require_user)):
     """Add movie to watch history"""
+    # Check if movie exists
+    movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
+    if not movie.data:
+        raise HTTPException(status_code=404, detail="Movie not found")
+    
     # Check if exists
     existing = supabase_client.table('watch_history')\
         .select('*')\
@@ -856,6 +887,7 @@ async def add_to_history(movie_id: int, progress: int = 0, user = Depends(requir
         supabase_client.table('watch_history')\
             .update({
                 "progress": progress,
+                "completed": progress >= 90,  # Mark as completed if progress > 90%
                 "last_watched": datetime.now().isoformat()
             })\
             .eq('id', existing.data[0]['id'])\
@@ -867,6 +899,7 @@ async def add_to_history(movie_id: int, progress: int = 0, user = Depends(requir
                 "user_id": user['id'],
                 "movie_id": movie_id,
                 "progress": progress,
+                "completed": progress >= 90,
                 "last_watched": datetime.now().isoformat()
             })\
             .execute()
@@ -881,11 +914,21 @@ async def get_watchlist(user = Depends(require_user)):
         .eq('user_id', user['id'])\
         .execute()
     
-    return {"watchlist": [item['movies'] for item in result.data]}
+    watchlist = []
+    for item in result.data:
+        if item.get('movies'):
+            watchlist.append(item['movies'])
+    
+    return {"watchlist": watchlist}
 
 @app.post("/user/watchlist/{movie_id}")
 async def add_to_watchlist(movie_id: int, user = Depends(require_user)):
     """Add movie to watchlist"""
+    # Check if movie exists
+    movie = supabase_client.table('movies').select('*').eq('id', movie_id).execute()
+    if not movie.data:
+        raise HTTPException(status_code=404, detail="Movie not found")
+    
     # Check if already in watchlist
     existing = supabase_client.table('watchlist')\
         .select('*')\
@@ -944,11 +987,13 @@ async def get_admin_stats(owner = Depends(require_owner)):
         
         # Get storage info
         total_video_size = 0
+        video_count = 0
         if os.path.exists(f"{UPLOAD_DIR}/movies"):
             for file in os.listdir(f"{UPLOAD_DIR}/movies"):
                 file_path = os.path.join(f"{UPLOAD_DIR}/movies", file)
                 if os.path.isfile(file_path):
                     total_video_size += os.path.getsize(file_path)
+                    video_count += 1
         
         return {
             "movies": len(movies.data) if movies.data else 0,
@@ -957,14 +1002,15 @@ async def get_admin_stats(owner = Depends(require_owner)):
             "comments": len(comments.data) if comments.data else 0,
             "recent_users": len(recent_users.data) if recent_users.data else 0,
             "recent_messages": len(recent_messages.data) if recent_messages.data else 0,
-            "storage_used_gb": round(total_video_size / (1024**3), 2)
+            "storage_used_gb": round(total_video_size / (1024**3), 2),
+            "video_files": video_count
         }
     except Exception as e:
         print(f"Error getting stats: {e}")
         return {
             "movies": 0, "users": 0, "messages": 0, 
             "comments": 0, "recent_users": 0, "recent_messages": 0,
-            "storage_used_gb": 0
+            "storage_used_gb": 0, "video_files": 0
         }
 
 @app.get("/admin/users")
@@ -1093,5 +1139,9 @@ async def health_check():
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
         "database": "connected",
-        "uploads": os.path.exists(UPLOAD_DIR)
+        "uploads": os.path.exists(UPLOAD_DIR),
+        "upload_dirs": {
+            "movies": os.path.exists(f"{UPLOAD_DIR}/movies"),
+            "thumbnails": os.path.exists(f"{UPLOAD_DIR}/thumbnails")
+        }
     }
